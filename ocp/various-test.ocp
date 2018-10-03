@@ -1,0 +1,9 @@
+begin program "various-test"
+   sort = true
+   dirname = "src"
+   files = [
+       "various_test.ml"
+   ]
+   requires = ["kaminolib" "oUnit"]
+   has_byte = false
+end

@@ -1,0 +1,10 @@
+begin program "kamino"
+   sort = true
+   dirname = "src"
+   files = [
+       "kamino.ml"
+   ]
+   requires = ["bap" "kaminolib" "easy_format"]
+   asmcomp = ["-g"; "-strict-sequence"; "-annot"]
+   has_byte = false
+end

@@ -1,0 +1,8 @@
+begin program "debug-config"
+   requires = ["threads" "core" "core_extended" "str"]
+   dirname = "src"
+   files = [
+       "debug_config.ml"
+   ]
+   has_byte = false
+end

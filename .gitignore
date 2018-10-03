@@ -1,0 +1,38 @@
+# GCC object files
+*.o
+# Ocaml object files
+*.cmi
+*.cmx
+# Generated documentation files
+doc/
+# Test applications
+tests/guessword/*/guessword
+# Intermediate language files
+*.il
+*.til
+# Function boundary files
+*.fb
+# Log files
+*.log
+# User specific config files
+*.ucfg
+# Trace files
+*.bpt
+*.pfc
+# Latex Makefile output
+*.make
+*.bbl
+*.blg
+*.d
+*.fls
+*.pdf
+*.aux
+*.temp
+# Kamino analysis output
+*.dot
+*.out
+*.dp2
+# Makefile output
+.depend
+# OCP build folder
+_obuild

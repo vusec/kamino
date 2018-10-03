@@ -1,0 +1,37 @@
+--- Makefile.orig	2014-06-21 00:00:38.069283810 +0200
++++ Makefile	2014-06-21 00:36:24.039925084 +0200
+@@ -4,12 +4,10 @@
+ .PHONY: default all opt test doc soft-clean clean
+ default: all opt
+ all:
+-	ocamlc -c easy_format.mli
+-	ocamlc -c -dtypes easy_format.ml
++	ocamlc -a -o easy_format.cma -dtypes easy_format.mli easy_format.ml
+ 	touch bytecode
+ opt:
+-	ocamlc -c easy_format.mli
+-	ocamlopt -c -dtypes easy_format.ml
++	ocamlopt -a -o easy_format.cmxa -dtypes easy_format.mli easy_format.ml
+ 	touch nativecode
+ test: all simple_example.out
+ 	ocamlc -o test_easy_format -dtypes easy_format.cmo test_easy_format.ml
+@@ -34,7 +32,7 @@
+ 	caml2html easy_format_example.ml -t -o easy_format_example.html
+ 
+ soft-clean:
+-	rm -f *.cm[iox] *.o *.annot \
++	rm -f *.cm[ioxa] *.o *.annot *.a *.cmxa \
+ 		test_easy_format lambda_example simple_example \
+ 		bytecode nativecode
+ 
+@@ -45,8 +43,8 @@
+ 
+ 
+ COMMON_INSTALL_FILES = META easy_format.cmi easy_format.mli
+-BC_INSTALL_FILES = easy_format.cmo 
+-NC_INSTALL_FILES = easy_format.cmx easy_format.o
++BC_INSTALL_FILES = easy_format.cma easy_format.cmo
++NC_INSTALL_FILES = easy_format.cmxa easy_format.a easy_format.o easy_format.cmx
+ 
+ install:
+ 	echo "version = \"$(VERSION)\"" > META; cat META.tpl >> META

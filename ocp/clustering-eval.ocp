@@ -1,0 +1,10 @@
+begin program "clustering-eval"
+   sort = true
+   dirname = "src"
+   files = [
+       "clustering_eval.ml"
+       "sym_resolver.ml"
+   ]
+   requires = ["str" "fileutils" "core" "core_extended" "yojson" "lwt.unix"]
+   has_byte = false
+end

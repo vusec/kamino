@@ -1,0 +1,5 @@
+#!/bin/bash
+
+for path in $*; do
+    sed -i "s/\(@asm\s\+[^<]\+\)/<tspan style=\"font-family:Arial;font-weight:bold;fill:#800000\">\1<\/tspan>/g" "$path"
+done

@@ -1,0 +1,7 @@
+begin objects "yojson"
+   generated = true
+   has_byte = false
+   dirname = [ "%{OPAMLIB}%" "yojson" ]
+   files = ["yojson.ml"]
+   requires = ["easy_format" "biniou"]
+end

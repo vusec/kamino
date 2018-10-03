@@ -1,0 +1,19 @@
+begin
+   generated = true
+   dirname = [ "%{OPAMLIB}%" "type_conv" ]
+   begin library "pa_type_conv"
+     byte_targets = ["pa_type_conv.cma"]
+   end
+end
+
+begin
+   generated = true
+   dirname = [ "%{OPAMLIB}%" "sexplib" ]
+   begin library "pa_sexp_conv"
+     byte_targets = ["pa_sexp_conv.cma"]
+     requires = ["pa_type_conv"]
+   end
+   begin syntax "syntax-for-sexplib"
+     requires = ["pa_sexp_conv" "camlp4o"]
+   end
+end

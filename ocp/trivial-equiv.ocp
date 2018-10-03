@@ -1,0 +1,16 @@
+begin program "trivial-equiv"
+   sort = true
+   has_byte = false
+   dirname = "src"
+   files = [
+       "trivial_equiv.ml"
+       "batchspec.mli"
+       "batchspec.ml" (syntax = "syntax-for-sexplib")
+       "batch.ml" (syntax = "syntax-for-sexplib")
+       "input.ml" (syntax = "syntax-for-sexplib")
+       "misc.ml"
+       "print.ml"
+       "eval_cluster.ml"
+   ]
+   requires = ["core" "core_extended" "batteries" "bap" "fileutils" "syntax-for-sexplib"]
+end

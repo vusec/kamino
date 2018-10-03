@@ -1,0 +1,6 @@
+begin library "easy_format"
+   generated = true
+   has_byte = false
+   dirname = [ "%{OPAMLIB}%" "easy-format" ]
+   asm_targets = ["easy_format.cmxa"]
+end

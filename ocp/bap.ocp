@@ -1,0 +1,27 @@
+begin library "libtrace"
+      generated = true
+      has_byte = false
+      dirname = ["deps/bap/libtracewrap/libtrace/src/ocaml"]
+      asm_targets = ["libtrace.cmxa"]
+      requires = ["batteries" "piqi.lib" "easy-format"]
+end
+
+begin library "bap"
+      generated = true
+      has_byte = false
+      dirname = ["deps/bap/ocaml"]
+      asm_targets = ["bap.cmxa"]
+      requires = [
+          "libtrace"
+          "batteries"
+          "bigarray"
+          "str"
+          "unix"
+          "sexplib"
+          "zarith"
+          "objsize"
+          "ocamlgraph"
+          "pcre"
+      ]
+      link = ["-I" "deps/bap/libasmir/src"]
+end

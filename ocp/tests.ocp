@@ -1,0 +1,45 @@
+begin
+   sort = true
+   dirname = "src"
+   test_dir = "%{results}%"
+   has_byte = false
+   test_byte = false
+   requires = ["kaminolib" "oUnit"]
+
+   begin test "assumptions"
+      files = ["assumptions_test.ml"]
+   end
+
+   begin test "ssa-ext-eval"
+         files = ["ssa_ext_eval_test.ml"]
+   end
+
+   begin test "various-test^2"
+      files = []
+      requires = ["various-test"]
+   end
+
+   begin test "cfg-convenience"
+      files = ["cfg_convenience_test.ml"]
+   end
+
+   begin test "transfer-function"
+      files = ["transfer_function_test.ml"]
+   end
+
+   begin test "interval-tree"
+      files = ["imtree_test.ml"]
+   end
+
+   begin test "reachable-loads-test"
+      files = ["reachable_loads_test.ml"]
+   end
+
+   begin test "track-exp-bits"
+      files = ["track_exp_bits_test.ml"]
+   end
+
+   begin test "arithmetic"
+      files = ["arithmetic_test.ml"]
+   end
+end

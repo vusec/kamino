@@ -1,0 +1,11 @@
+begin library "eval-batch-lib"
+   sort = true
+   dirname = "src"
+   files = [
+       "eval_batch.ml" (syntax = "syntax-for-sexplib")
+       "sym_resolver.ml"
+   ]
+   requires = ["sexplib" "core" "core_extended"
+               "yojson" "batteries" "kaminolib" "syntax-for-sexplib"]
+   has_byte = false
+end

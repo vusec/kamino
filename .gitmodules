@@ -1,0 +1,4 @@
+[submodule "deps/bap"]
+	path = deps/bap
+	url = ssh://git@git.cs.vu.nl:1337/r.vermeulen/bap.git
+	ignore = dirty

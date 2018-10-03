@@ -1,0 +1,366 @@
+#!/usr/bin/env ruby
+
+require 'colorize'
+require 'tempfile'
+require 'optparse'
+require 'readline'
+require 'singleton'
+
+def pute(s)
+  $stderr.puts(s)
+end
+
+def putd(s)
+  $stderr.puts(s)
+end
+
+class IR
+  attr_reader :name
+  def initialize(path)
+    @path = path
+    @name = File.basename(path)
+  end
+  def same_kind?(other)
+    @name == other.name
+  end
+  def equal?(other)
+    contents.strip == other.contents.strip
+  end
+
+  def diff(other, cmd, opts)
+    Tempfile.open(@name) { |us|
+      us.write(diff_matter(opts))
+      us.flush
+      Tempfile.open(other.name) { |them|
+        them.write(other.diff_matter(opts))
+        them.flush
+        if opts[:terminal]
+          system("#{cmd} #{us.path} #{them.path}")
+        else
+          return `#{cmd} #{us.path} #{them.path}`
+        end
+      }
+    }
+  end
+  def to_s
+    "IR:#{@path}"
+  end
+  def self.expand_newlines(str)
+    str.gsub(/\\n/, "\n")
+  end
+  def has_cfg?
+    false
+  end
+  protected
+  def contents
+    IR.expand_newlines(IO.read(@path, 1024 ** 2))
+  end
+  def cfg
+    nil
+  end
+  def load_cfg
+    contents.split("\n").select { |l|
+      /BB_\w+\s+->\s+BB_\w+/.match(l)
+    }.join("\n")
+  end
+  def diff_matter(opts)
+    if opts[:cfg]
+      cfg
+    else
+      contents
+    end
+  end
+  def self.new_ir(path)
+    if /.*\.ast$/.match(path)
+      return AstIr.new(path)
+    elsif /.*\.ast.dot$/.match(path)
+      return AstCfgIr.new(path)
+    elsif /.*\.ssa.dot$/.match(path)
+      return SsaCfgIr.new(path)
+    else
+      return IR.new(path)
+    end
+  end
+end
+
+class DummyIr < IR
+  include Singleton
+
+  def initialize
+    @path = "/none"
+    @name = "<none>"
+  end
+  def same_kind?(other)
+    other == self
+  end
+  def equal?(other)
+    other == self
+  end
+  def diff(a, b, c)
+    "Cannot diff against empty IR"
+  end
+  def to_s
+    "IR:<none>"
+  end
+  def has_cfg?
+    false
+  end
+  protected
+  def contents
+    "<empty>"
+  end
+  def cfg
+    nil
+  end
+  def diff_matter(opts)
+    contents
+  end
+end
+
+class AstIr < IR
+  def to_s
+    "AstIR:#{@path}"
+  end
+end
+
+class AstCfgIr < IR
+  def cfg
+    load_cfg
+  end
+  def has_cfg?
+    true
+  end
+  def to_s
+    "AstCfgIR:#{@path}"
+  end
+end
+
+class SsaCfgIr < IR
+  def cfg
+    load_cfg
+  end
+  def has_cfg?
+    true
+  end
+  def to_s
+    "SsaCfgIR:#{@path}"
+  end
+end
+
+class Pipeline
+  def initialize(path)
+    raise "No such dir: #{path}" unless File.directory?(path)
+    @dir = Dir.new(path)
+    @entries = @dir.sort_by {|e|
+      e
+    }.select { |e|
+      not File.directory?(childpath(e))
+    }
+  end
+  def irs
+    @entries.collect {|e|
+      IR.new_ir(childpath(e))
+    }
+  end
+  def ir_pairs(other)
+    ours = irs
+    theirs = other.irs
+    # make sure we zip the longer list with the shorter one, so that
+    # we produce [el, nil] pairs when the lengths differ
+    ir_pairs = nil
+    if ours.length >= theirs.length
+      ir_pairs = ours.zip(theirs)
+    else
+      ir_pairs = theirs.zip(ours)
+    end
+    ir_pairs.collect! { |pair|
+      l, r = pair
+      if r.nil? or not l.same_kind?(r)
+        pute("Inconsistent pipeline progression: #{l} <-> #{r}".yellow)
+        exit(2) unless $options[:sloppy]
+      end
+      r = DummyIr.instance if r.nil?
+      [l, r]
+    }
+    ir_pairs
+  end
+  private
+  def childpath(e)
+    "#{@dir.path}/#{e}"
+  end
+end
+
+def do_diff(left, right)
+  ir_pairs = left.ir_pairs(right)
+  ir_pairs.each { |pair|
+    l, r = pair
+    puts("diff #{l} #{r}")
+    puts(l.diff(r, "diff -u", :cfg => false, :terminal => false))
+  }
+end
+
+class DiffCmd
+  attr_reader :short, :long
+  def initialize(short, long, args, help)
+    @short = short
+    @long = long
+    @args = args
+    @help = help
+  end
+  def takes_args?
+    not @args.nil?
+  end
+  def to_s
+    "[#{@short}|#{@long}] #{@args}\t#{@help}"
+  end
+end
+
+class DiffInteractive
+  @@cmds = [
+    DiffCmd.new("h", "help", nil,
+                "Show help information"),
+    DiffCmd.new("d", "diff", "<pairnr>",
+                "diff n: Diff a pair of IRs"),
+    DiffCmd.new("l", "list", nil,
+                "list what's available"),
+    DiffCmd.new("dcfg", "diffcfg", "<pairnr>",
+                "diffcfg n: Diff the CFGs of a pair"),
+    DiffCmd.new("vd", "vimdiff", "<pairnr>",
+                "vimdiff n"),
+    DiffCmd.new("q", "quit", nil,
+                "quit: exit the program"),
+  ]
+  def initialize(left, right)
+    @left = left
+    @right = right
+    @ir_pairs = left.ir_pairs(right)
+  end
+  def parse_spec(str)
+    putd("str: '#{str}'")
+    if str[0] == 'l'
+      return @left.irs[str[1..-1].to_i]
+    end
+    if str[0] == 'r'
+      return @right.irs[str[1..-1].to_i]
+    end
+    raise "Expected a l/r prefix"
+  end
+  def diff_args(args)
+    # lN, rM
+    # lN, lM
+    # N
+    arg1 = args.shift
+    if arg1[0] == 'l' or arg1[0] == 'r'
+      arg1 = parse_spec(arg1)
+      arg2 = parse_spec(args.shift)
+      return [arg1, arg2]
+    end
+    @ir_pairs[arg1.to_i]
+  end
+  def self.cfgflag(curr, prev)
+    if prev.has_cfg? and curr.has_cfg? and
+        curr.diff(prev, "diff", :cfg => true, :terminal => false) != ""
+      return" #cfg".red
+    end
+    ""
+  end
+  def self.nopflag(curr, prev)
+    if curr.equal?(prev)
+      return " #nop".green
+    end
+    ""
+  end
+  def self.calc_flags(curr, prev)
+    DiffInteractive.nopflag(curr, prev) << DiffInteractive.cfgflag(curr, prev)
+  end
+  def list
+    @ir_pairs.each_with_index { |pair, i|
+      l, r = pair
+      lflags = ""
+      rflags = ""
+      if i > 0
+        prev_left, prev_right = @ir_pairs[i - 1]
+        lflags << DiffInteractive.calc_flags(l, prev_left)
+        rflags << DiffInteractive.calc_flags(r, prev_right)
+      end
+      puts("#{i.to_s.rjust(2)}) #{l.name.ljust(40)}#{lflags.rjust(4)}\t\t#{i.to_s.rjust(2)}) #{r.name.ljust(40)}#{rflags.rjust(4)}")
+    }
+  end
+  def do_diff(cmd, args, opts)
+    l, r = diff_args(args)
+    l.diff(r, cmd, opts)
+  end
+  def diff(args)
+    do_diff("diff -u", args, :cfg => false)
+  end
+  def vimdiff(args)
+    do_diff("vimdiff", args, :cfg => false, :terminal => true)
+  end
+  def diffcfg(args)
+    l, r = diff_args(args)
+    l.diff(r, "diff -u", :cfg => true, :terminal => false)
+  end
+  def help
+    @@cmds.each { |cmd|
+      puts(cmd)
+    }
+  end
+  def quit
+    exit(0)
+  end
+  def loop
+    list
+    while true
+      inp = Readline.readline("(use 'h' for help) > ", true)
+      if inp.nil?
+        # Control-D doesn't come with a newline
+        puts("")
+        exit(0)
+      end
+      args = inp.split()
+      cmdstr = args.shift
+      cmd = @@cmds.find { |c|
+        c.short == cmdstr or c.long == cmdstr
+      }
+      if cmd.nil?
+        puts("No such command: #{cmdstr}")
+        next
+      end
+      sym = cmd.long.to_sym
+      if cmd.takes_args?
+        send(cmd.long.to_sym, args)
+      else
+        send(sym)
+      end
+    end
+  end
+end
+
+$options = {
+}
+
+command = ARGV.shift
+parser = OptionParser.new { |opts|
+  opts.on("-c", "--cfg", "CFG structure only") {
+    $options[:cfg] = true
+  }
+  opts.on("-s", "--sloppy", "Allow inconsistent pipeline progressions and whatnot") {
+    $options[:sloppy] = true
+  }
+}
+
+case command
+when "diff-interactive"
+  parser.parse!
+  left = Pipeline.new(ARGV.shift)
+  right = Pipeline.new(ARGV.shift)
+  DiffInteractive.new(left, right).loop
+when "diff-two"
+  parser.parse!
+  left = Pipeline.new(ARGV.shift)
+  right = Pipeline.new(ARGV.shift)
+  do_diff(left, right)
+else
+  pute("Unknown command: #{command}")
+  exit(2)
+end

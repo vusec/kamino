@@ -1,0 +1,14 @@
+begin program "eval"
+   sort = true
+   dirname = "src"
+   files = [
+       "batchspec.mli"
+       "batchspec.ml" (syntax = "syntax-for-sexplib")
+       "eval_cluster.ml"
+       "eval.ml"
+   ]
+   requires = ["core" "core_extended" "str" "eval-batch-lib"
+               "yojson" "fileutils" "magic" "kaminolib" "bap"
+	       "syntax-for-sexplib"]
+   has_byte = false
+end

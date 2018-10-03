@@ -1,0 +1,774 @@
+#!/usr/bin/env ruby
+require 'singleton'
+require 'optparse'
+require 'json'
+require 'tempfile'
+require 'tmpdir'
+require 'fileutils'
+require 'concurrent'
+
+$ncpus = `grep -c ^processor /proc/cpuinfo`.to_i
+$partition_factor = 2
+$basedir = File.dirname(File.realpath(__FILE__))
+
+$tdpool = Concurrent::executor(:io)
+
+def putd(s)
+  if $options[:debug]
+    $stderr.puts(s)
+  end
+end
+
+def pute(s)
+  $stderr.puts(s)
+end
+
+def partition_into_n(ary, n)
+  len = ary.length
+  putd("partition_into_n: len #{len} n #{n}")
+  if n >= len
+    return [ary]
+  end
+  batchsize = len / n
+  batches = []
+  n.times { |i|
+    offset = i * batchsize
+    nelems = batchsize
+    batch = ary[offset, nelems]
+    putd("Generating batch [len = #{batch.size}] #{batch}")
+    batches << batch
+  }
+  rem = len % n
+  if rem != 0
+    batch = ary[len - rem, rem]
+    putd("Generating rembatch [len = #{batch.size}] #{batch}")
+    batches << batch
+  end
+  nclusters_in_batches = batches.inject(0) { |sum, b| sum + b.size}
+  if nclusters_in_batches != len
+    pute("Incorrect number of clusters in batches (#{nclusters_in_batches} != #{len})")
+    exit(3)
+  end
+  batches
+end
+
+class SymResolver
+  include Singleton
+  def initialize
+    @cache = {}
+  end
+  def lookup(binary, sym)
+    lines = @cache[binary]
+    if lines.nil?
+      if not File.exists?(binary)
+        return nil
+      end
+      lines = IO.popen("nm #{binary} | grep -w T").readlines
+    end
+    @cache[binary] = lines
+    lines.each { |l|
+      md = /^([0-9a-fA-F]+)\s+T\s+(.*)$/.match(l)
+      if not md.nil? and md[2] == sym
+        return md[1].to_i(16)
+      end
+    }
+    raise "Couldn't find address for #{sym} in #{binary}"
+  end
+end
+
+class Subject
+  attr_reader :sym, :addr
+  def self.create(cc, ccv, prim_name, impl, param)
+    binary = self.binary(cc, ccv, prim_name, param)
+    sym = self.sym(prim_name, impl)
+    addr = SymResolver.instance.lookup(File.join($options[:builddir], prim_name, binary), sym)
+    if addr.nil?
+      return nil
+    end
+    self.new(cc, ccv, prim_name, impl, param, addr)
+  end
+  def self.binary(cc, ccv, prim_name, param)
+    "#{cc}-#{ccv}-#{param}-#{prim_name}"
+  end
+  def self.sym(prim_name, impl)
+    "#{impl}_#{prim_name}"
+  end
+  def initialize(cc, ccv, prim_name, impl, param, addr)
+    @cc = cc
+    @ccv = ccv
+    @prim_name = prim_name
+    @sym = Subject.sym(prim_name, impl)
+    @param = param
+    @addr = addr
+  end
+  def to_s
+    #    "#{@prim_name}-#{@cc}-#{@ccv}-#{@param}-#{@sym}-#{sprintf("%#x", @addr)}"
+    # Go with the short version for easier debugging
+    @param
+  end
+  def binary_path
+    File.join($options[:builddir], @prim_name, binary_name)
+  end
+  private
+  def binary_name
+    "#{@cc}-#{@ccv}-#{@param}-#{@prim_name}"
+  end
+end
+
+class Stats
+  attr_accessor :comparisons
+  def initialize
+    @comparisons = []
+    @start_time = Time.now
+  end
+  def to_s
+    runtime = Time.now - @start_time
+    "#comparisons: #{@comparisons.size}\n" +
+    "Total comparison time: #{sprintf("%.2f", total_time)}s\n" +
+    "Actual runtime: #{sprintf("%.2f", runtime)}s\n" +
+    "Speedup: #{sprintf("%.2f", total_time / runtime)}"
+  end
+  def to_hash
+    {
+      comparisons: @comparisons
+    }
+  end
+  private
+  def total_time
+    @comparisons.inject { |a, b| a + b}
+  end
+end
+
+class EquivalenceUtil
+  def initialize(path)
+    tf = Tempfile.new(File.basename(path))
+    tf.close(false)
+    # Take a snapshot of the binary, so it'll not be changed from under us
+    # during the run
+    FileUtils.install(path, tf.path, mode: 0550)
+    @path = tf.path
+    # Maintain a reference so that the file won't be deleted until
+    # we exit
+    @tf = tf
+  end
+  def gen_batch(p1, sym1, addr1, p2, sym2, addr2)
+    batch = "
+((version 1)
+ (runs
+  (((binaries
+     (((path #{p1}) (parameters ()))
+      ((path #{p2}) (parameters ()))))
+    (inlines
+     (((parent ((binary_idx 0) (name #{sym1}) (addr #{addr1})))
+       (out_of_line_copy
+        ((binary_idx 1) (name #{sym2}) (addr #{addr2}))))))))))"
+    batch
+  end
+end
+
+class TrivialEquiv < EquivalenceUtil
+  def equivalent?(p1, sym1, addr1, p2, sym2, addr2)
+    batch = gen_batch(p1, sym1, addr1, p2, sym2, addr2)
+    Tempfile.open("batch") { |bf|
+      bf.write(batch)
+      bf.flush
+      p = IO.popen("#{@path} -b #{bf.path} 2>/dev/null")
+      output = p.readline.chomp
+      md = /^.*\Widentical$*/.match(output)
+      ret = (not md.nil?)
+      return ret
+    }
+  end
+  def to_s
+    "trivial"
+  end
+end
+
+class KaminoEquiv < EquivalenceUtil
+  def equivalent?(p1, sym1, addr1, p2, sym2, addr2)
+    batch = gen_batch(p1, sym1, addr1, p2, sym2, addr2)
+    outdir = nil
+    base = "#{File.basename(p1)}-#{sym1}--#{File.basename(p2)}-#{sym2}"
+    if $options[:debugdir]
+      outdir = File.join($options[:debugdir], base)
+      FileUtils.mkdir_p(outdir)
+    else
+      outdir = Dir.mktmpdir(base)
+    end
+    begin
+      batchpath = File.join(outdir, "batch")
+      File.open(batchpath, "w") { |bf|
+        bf.write(batch)
+        bf.flush
+      }
+      cmd = "#{@path} -no-fork -timeout 30m -batch '#{batchpath}' -outdir '#{outdir}' >'#{File.join(outdir, "kamino.log")}' 2>&1"
+      putd("EXEC: #{cmd}")
+      system(cmd)
+      if not kamino_finished(outdir)
+        pute("Kamino did not finish!")
+        return false
+      end
+      return find_exact_in_overview(outdir)
+    ensure
+      if $options[:debugdir].nil?
+        FileUtils.remove_dir(outdir, true)
+      end
+    end
+  end
+  def to_s
+    "kamino"
+  end
+  private
+  def kamino_finished(outdir)
+    result_log = File.join(outdir, "result.log")
+    if not File.exists?(result_log)
+      pute("Kamino finished, but  no #{result_log}")
+      return false
+    end
+    result = IO.read(result_log).chomp
+    if result != "success!"
+      pute("Kamino for #{outdir} failed (#{result}, assuming !equivalent")
+      return false
+    end
+    return true
+  end
+  def find_exact_in_overview(outdir)
+    overviewpath = File.join(outdir, "results", "0", "overview")
+    if not File.exists?(overviewpath)
+      putd("#{outdir}: No overview file")
+      return false
+    end
+    lines = IO.readlines(overviewpath)
+    lines.each { |l|
+      if /ExactOnly\s*\(OverlapTotal\s+/.match(l)
+        return true
+      end
+    }
+    putd("#{outdir}: No ExactOnly in overview")
+    return false
+  end
+end
+
+class Cluster
+  attr_reader :subjects, :equivalent_subjects
+  def initialize
+    @subjects = Array.new
+    @equivalent_subjects = {}
+  end
+  def to_s
+    "<<#{@subjects.join(", ")}>>"
+  end
+  def merge(other)
+    putd("?==> Merge #{self} with #{other}")
+    @subjects.concat(other.subjects)
+  end
+  def find_in_cache(equivalence_tester, other)
+    equiv = equivalence_tester.to_s
+    # equivalence depends on the equivalence tester. Don't mix up
+    # trivial/kamino equivalence
+    if @equivalent_subjects[equiv].nil?
+      @equivalent_subjects[equiv] = {}
+    end
+    if other.equivalent_subjects[equiv].nil?
+      other.equivalent_subjects[equiv] = {}
+    end
+    # Have we ever been compared to any of the other subjects?
+    @equivalent_subjects[equiv].each_key { |subj|
+      cached = other.equivalent_subjects[equiv][subj]
+      if not cached.nil?
+        return cached
+      end
+    }
+    return nil
+  end
+  def add_to_cache(equivalence_tester, other, ret)
+    equiv = equivalence_tester.to_s
+    @equivalent_subjects[equiv].merge(other.equivalent_subjects[equiv]) { |k, old, new|
+      if old != new
+        raise "subject #{k} was #{old}, now becomes #{new}"
+      end
+      old
+    }
+    other.equivalent_subjects[equiv].merge(@equivalent_subjects[equiv]) { |k, old, new|
+      if old != new
+        raise "other subject #{k} was #{old}, now becomes #{new}"
+      end
+      old
+    }
+  end
+  def test_equivalent(equivalence_tester, stats, other)
+    cached = find_in_cache(equivalence_tester, other)
+    if not cached.nil?
+      putd("Using cached result: #{cached}")
+      return cached
+    end
+    subj1 = @subjects[0]
+    subj2 = other.subjects[0]
+    start_time = Time.now
+    ret = equivalence_tester.equivalent?(subj1.binary_path,
+                                          subj1.sym,
+                                          subj1.addr,
+                                          subj2.binary_path,
+                                          subj2.sym,
+                                          subj2.addr
+                                          )
+    putd("test_equivalent #{self} <-> #{other}: #{ret}")
+    stats.comparisons << (Time.now - start_time)
+    add_to_cache(equivalence_tester, other, ret)
+    ret
+  end
+  def self.reduce(level, equivalence_tester, stats, clusters)
+    putd("#{"==" * level}> Cluster.reduce (#{equivalence_tester}) #{clusters}")
+    new_clusters = []
+    clusters.each { |cl|
+      if cl.class != Cluster
+        raise "Not a cluster: #{cl.class}"
+      end
+      found = false
+      new_clusters.each { |ncl|
+        if ncl.test_equivalent(equivalence_tester, stats, cl)
+          ncl.merge(cl)
+          found = true
+          break
+        end
+      }
+      if not found
+        new_clusters << cl
+      end
+    }
+    new_clusters
+  end
+  def self.doit(level, equivalence_tester, stats, clusters)
+    putd("#{"==" * level}> doit (#{equivalence_tester}) #{clusters}")
+    batches = partition_into_n(clusters, $partition_factor)
+    batch_futures = batches.collect { |b|
+      if b.length <= $partition_factor
+        Concurrent::Future.execute(executor: $tdpool) {
+          Cluster.reduce(level, equivalence_tester, stats, b)
+        }
+      else
+        Cluster.doit(level + 1, equivalence_tester, stats, b)
+      end
+    }
+    Concurrent::Future.execute(executor: $tdpool) {
+      reduced_clusters = batch_futures.collect { |f|
+        ret = f.value
+        if f.rejected?
+          putd("Failed<doit>: #{f.reason}\n#{f.reason.backtrace.join("\n")}")
+          raise f.reason
+        end
+        ret
+      }
+      joined_clusters = reduced_clusters.flatten
+      putd("#{"==" * level}> joined #{reduced_clusters} to #{joined_clusters}")
+      reduce(level, equivalence_tester, stats, joined_clusters)
+    }
+  end
+end
+
+
+def subjects_of_config(cfg, compiler, primitive, implementation, param_name)
+  compilers = cfg[:compilers]
+  primitives = cfg[:primitives]
+  param = cfg[:available_parameters][param_name.to_sym]
+  compilers.each { |cc|
+    ccname = cc[:name]
+    cc[:versions].each { |v|
+      v = "#{v[:major]}.#{v[:minor]}.#{v[:patch]}"
+      ccv = "#{ccname}-#{v}"
+      next unless ccv == compiler
+      primitives.each { |prim|
+        next unless prim[:name] == primitive
+        prim[:implementations].each { |impl|
+          next unless implementation == impl
+          subjects = []
+          param[:space].each { |value|
+            value = param[:descr_fmt].gsub(/@/, value)
+            subj = Subject.create(ccname, v, primitive, implementation, value)
+            if not subj.nil?
+              subjects << subj
+            end
+          }
+          return subjects
+        }
+        raise "Couldn't find implementation #{implementation}"
+      }
+      raise "Couldn't find primitive #{primitive}"
+    }
+  }
+  raise "Couldn't find compiler #{compiler}"
+end
+
+class FutureStatusObserver
+  attr_accessor :reason
+  def initialize(obj, descr)
+    @reason = nil
+    @monitored_object = obj
+    @descr = descr
+    obj.add_observer(self)
+  end
+  def update(time, value, reason)
+    @reason = reason
+    if value.nil?
+      pute("Job #{@monitored_object} (#{@descr}) failed: #{reason}\n#{reason.backtrace.join("\n")}")
+    end
+  end
+  def to_s
+    "FutureStatusObserver: [#{@monitored_object}, #{@descr}, #{@reason}, #{@reason.backtrace.join("\n")}]"
+  end
+end
+
+def detect_nil(descr, ary)
+  ary.each { |el|
+    if el.nil?
+      pute("has a nil element: #{descr}")
+    end
+  }
+  ary
+end
+
+def do_single(cfg, compiler, primitive, impl, param, verbose)
+  subjects = subjects_of_config(cfg, compiler, primitive,
+                                impl, param)
+  clusters = subjects.collect { |s|
+    cl = Cluster.new
+    cl.subjects << s
+    cl
+  }
+
+  observers = []
+  clusters_after_each = []
+  equiv = $equivalence_testers[0]
+
+  stats_trivial = Stats.new
+  stats_kamino = Stats.new
+
+  fut1 = Cluster.doit(1, equiv, stats_trivial, clusters)
+  FutureStatusObserver.new(fut1, "doit1")
+  equiv = $equivalence_testers[1]
+
+  if not equiv.nil?
+    fut1 = Concurrent::dataflow_with($tdpool, fut1) { |clusters|
+      if clusters.nil?
+        pute("Failed<doit1>: (#{fut1.reason})\n#{fut1.reason.backtrace.join("\n")}")
+        exit(1)
+      end
+      if verbose
+        puts("verbose (clusters: #{clusters})")
+        puts("#{clusters.size} clusters from #{subjects.size} subjects")
+        puts(stats_trivial)
+      end
+      clusters2 = Cluster.doit(1, equiv, stats_kamino, clusters)
+      FutureStatusObserver.new(clusters2, "doit2")
+      [clusters, clusters2.value]
+    }
+  end
+  fut = Concurrent::dataflow_with($tdpool, fut1) { |arg|
+    clusters, clusters2 = arg
+    if verbose
+      puts("#{clusters2.size} clusters from #{subjects.size} subjects")
+      puts(stats_kamino)
+    end
+    clusters_after_each = arg
+    stats = [stats_trivial, stats_kamino]
+    if stats.size != clusters_after_each.size
+      raise "stats (#{stats.size}) != #clusters_after_each #{clusters_after_each.size}"
+    else
+      putd("zip sizes ok")
+    end
+    results = clusters_after_each.zip(stats)
+    o = {
+      compiler: compiler,
+      primitive: primitive,
+      implementation: impl,
+      parameter: param,
+      subjects: subjects.collect { |subj| subj.to_s},
+      results: results.collect { |result|
+        {
+          stats: result[1].to_hash,
+          clusters: result[0].collect { |cl|
+            cl.subjects.collect { |subj|
+              subj.to_s
+            }
+          }
+        }
+      }
+    }
+    if verbose
+      puts(JSON.pretty_generate(o))
+    end
+    o
+  }
+  return fut
+end
+
+def do_res(primname, impl, cc, res)
+  cltriv = res[:results][0][:clusters].size
+  clkamino = res[:results][1][:clusters].size
+  subjects = res[:subjects].size
+  puts("#{primname}\t#{impl}\t#{cc}\t#{subjects}\t#{cltriv}\t#{clkamino}")
+end
+
+def do_multi(cfg, param, primitive, implementation)
+  results = cfg[:primitives].select { |prim|
+    if primitive.nil?
+      true
+    else
+      prim[:name] == primitive
+    end
+  }.collect { |prim|
+    primname = prim[:name]
+    detect_nil "impls", prim[:implementations].select { |impl|
+      if implementation.nil?
+        true
+      else
+        impl == implementation
+      end
+    }.collect { |impl|
+      detect_nil "compilers", cfg[:compilers].collect { |compiler|
+        ccname = compiler[:name]
+        detect_nil "compiler", compiler[:versions].collect { |ccv|
+          next unless ccv[:patch] == "0"
+          cc = "#{ccname}-#{ccv[:major]}.#{ccv[:minor]}.#{ccv[:patch]}"
+          res = do_single(cfg, cc, primname, impl, param, false)
+          FutureStatusObserver.new(res, "do single #{cc}-#{primname}-#{impl}-#{param}")
+          ret = Concurrent::dataflow_with($tdpool, res) { |res|
+            if not res.nil?
+              do_res(primname, impl, cc, res)
+            else
+              pute("Failed<multi1>: #{res.reason}\n#{res.reason.backtrace.join("\n")}")
+            end
+            if res.nil?
+              raise "OMG WTF"
+            end
+            res
+          }
+          pute("ret = #{ret}")
+          ret
+        }.reject { |x| x.nil? }
+      }.flatten
+    }.flatten
+  }.flatten
+  results = results.collect { |res|
+    v = res.value
+    if v.nil?
+      pute("Failed<multi2>: #{res.reason}\n#{res.reason.backtrace.join("\n")}")
+    end
+    v
+  }
+  json = JSON.pretty_generate(results)
+  if not $options[:outfile].nil?
+    File.open($options[:outfile], "w") { |f|
+      f.write(json)
+      f.flush
+    }
+  else
+    puts(json)
+  end
+end
+
+def load_stats(paths)
+  paths.collect { |p|
+    results = JSON.load(IO.read(p), nil, symbolize_names: true)
+  }.flatten
+end
+
+def do_stats_list(paths)
+  results = load_stats(paths)
+  puts("%-30s\t#subj\t#triv\t#kamino" % "descr")
+  results.each { |res|
+    nsubjects = res[:subjects].size
+    nclusters_triv = res[:results][0][:clusters].size
+    nclusters_kamino = res[:results][1][:clusters].size
+    descr = "#{res[:compiler]}-#{res[:primitive]}-#{res[:implementation]}"
+    puts("%-30s\t#{nsubjects}\t#{nclusters_triv}\t#{nclusters_kamino}" % descr)
+  }
+end
+
+def do_stats_time(paths, off)
+  results = load_stats(paths)
+  results.each { |res|
+    times = res[:results][off][:stats][:comparisons]
+    times.each { |t|
+      puts("#{t}")
+    }
+  }
+end
+
+def nil2z(x)
+  if x.nil?
+    0
+  else
+    x
+  end
+end
+
+def display_hists(hist1, hist2)
+  min = [hist1.keys.min, hist2.keys.min].min
+  max = [hist1.keys.max, hist2.keys.max].max
+  (max - min + 1).times { |i|
+    idx = min + i
+    el1 = hist1[idx]
+    el2 = hist2[idx]
+    puts("#{idx}\t#{nil2z(el1)}\t#{nil2z(el2)}")
+  }
+end
+
+def hist(ary)
+  bins = ary.group_by { |v| v }
+  hsh = {}
+  bins.each { |bin|
+    idx, vs = bin
+    hsh[idx] = vs.size
+  }
+  hsh
+end
+
+def do_stats_hist(paths)
+  results = load_stats(paths)
+
+  triv = []
+  kamino = []
+  results.each { |res|
+    triv << res[:results][0][:clusters].size
+    kamino << res[:results][1][:clusters].size
+  }
+  display_hists(hist(triv), hist(kamino))
+end
+
+$trivial_equivalence_tester =
+  TrivialEquiv.new(File.join($basedir, "..", "_obuild",
+                             "trivial-equiv", "trivial-equiv.asm"))
+$kamino_equivalence_tester =
+  KaminoEquiv.new(File.join($basedir, "..", "_obuild",
+                            "kamino", "kamino.asm"))
+$equivalence_testers = [$trivial_equivalence_tester, $kamino_equivalence_tester]
+
+def setup_equivalence_tester(str)
+  case str
+  when "kamino"
+    $equivalence_testers = [$kamino_equivalence_tester]
+  when "trivial"
+    $equivalence_testers = [$trivial_equivalence_tester]
+  when "trivial+kamino"
+    # Nothing to do, default
+  else
+    pute("Unknown equivalence comparison method '#{$options[:equivalence]}'")
+    exit(2)
+  end
+end
+
+def set_executor()
+  name = $options[:executor]
+  if name == "immediate"
+    $tdpool = Concurrent::executor(:immediate)
+  elsif name == "io"
+    $tdpool = Concurrent::executor(:io)
+  else
+    pute("Unknown executor: #{name}")
+  end
+end
+
+def parse_options(opts)
+  opts.parse!
+  set_executor
+  puts("Using executor: #{$options[:executor]}")
+end
+
+$options = {
+  :executor => "io",
+}
+
+single_options = OptionParser.new { |opts|
+  opts.on("-E", "--executor=NAME", "Executor to use with ruby-concurrent") { |e|
+    $options[:executor] = e
+  }
+  opts.on("-b", "--builddir=PATH", "Path to build dir") { |p|
+    $options[:builddir] = p
+  }
+  opts.on("-C", "--config=PATH", "Path to config file") { |p|
+    $options[:configpath] = p
+  }
+  opts.on("-c", "--compiler=CCANDVERSOIN", "gcc-x.y.z") { |n|
+    $options[:compiler] = n
+  }
+  opts.on("-p", "--primitive=NAME", "E.g. memcpy") { |n|
+    $options[:primitive] = n
+  }
+  opts.on("-i", "--implementation=NAME", "E.g. bsd4_memcpy") { |n|
+    $options[:implementation] = n
+  }
+  opts.on("-P", "--parameter=NAME", "E.g. march") { |n|
+    $options[:parameter] = n
+  }
+  opts.on("-D", "--debug-dir=PATH", "Path to dump debug info in"){ |p|
+    $options[:debugdir] = p
+  }
+  opts.on("-d", "--debug", "Produce debug output") { |d|
+    $options[:debug] = d
+  }
+  opts.on("-e", "--equivalence=NAME",
+          "Equivalence algorithm [trivial|kamino|trivial+kamino(default)]") { |eq|
+    setup_equivalence_tester(eq)
+  }
+}
+
+multi_options = OptionParser.new { |opts|
+  opts.on("-E", "--executor=NAME", "Executor to use with ruby-concurrent") { |e|
+    $options[:executor] = e
+  }
+  opts.on("-C", "--config=PATH", "Path to config file") { |p|
+    $options[:configpath] = p
+  }
+  opts.on("-b", "--builddir=PATH", "Path to build artifacts") { |p|
+    $options[:builddir] = p
+  }
+  opts.on("-p", "--primitive=NAME", "Primitive (omit for all)") { |p|
+    $options[:primitive] = p
+  }
+  opts.on("-P", "--param=NAME", "Parameter (olvl|march)") { |n|
+    $options[:param] = n
+  }
+  opts.on("-i", "--implementation=NAME", "Implementation (needs -p)") { |n|
+    $options[:implementation] = n
+  }
+  opts.on("-o", "--outfile=PATH", "File to save results in") { |p|
+    $options[:outfile] = p
+  }
+}
+
+command = ARGV.shift
+
+case command
+when "single"
+  parse_options(single_options)
+  putd("starting")
+  cfg = JSON.load(IO.read($options[:configpath]), nil, symbolize_names: true)
+  f = do_single(cfg, $options[:compiler], $options[:primitive],
+            $options[:implementation], $options[:parameter], true)
+  if f.value.nil?
+    pute("Failed<single>: #{f.reason}\n#{f.reason.backtrace.join("\n")}")
+  end
+  putd("exiting")
+  exit(0)
+when "multi"
+  parse_options(multi_options)
+  if not $options[:implementation].nil? and $options[:primitive].nil?
+    pute("Implementation specified w/o a primitive")
+    exit(2)
+  end
+  cfg = JSON.load(IO.read($options[:configpath]), nil, symbolize_names: true)
+  do_multi(cfg, $options[:param], $options[:primitive], $options[:implementation])
+when "stats-list"
+  do_stats_list(ARGV)
+when "stats-hist"
+  do_stats_hist(ARGV)
+when "stats-time"
+  off = Integer(ARGV.shift)
+  do_stats_time(ARGV, off)
+else
+  pute("Unknown command '#{command}'")
+  exit(2)
+end
+
+

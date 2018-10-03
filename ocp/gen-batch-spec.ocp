@@ -1,0 +1,11 @@
+begin program "gen-batch-spec"
+   dirname = "src"
+   files = [
+       "batchspec.mli"
+       "batchspec.ml"  (syntax = "syntax-for-sexplib")
+       "gen_batch_spec.ml"
+   ]
+   requires = ["syntax-for-sexplib" "sexplib" "kaminolib"]
+   has_byte = false
+   asmcomp = ["-g"; "-strict-sequence"]
+end
